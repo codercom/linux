@@ -229,6 +229,7 @@ static void ovl_free_fs(struct ovl_fs *ofs)
 	unsigned i;
 
 	dput(ofs->indexdir);
+	dput(ofs->whiteout);
 	dput(ofs->workdir);
 	if (ofs->workdir_locked)
 		ovl_inuse_unlock(ofs->workbasedir);
@@ -959,6 +960,10 @@ static int ovl_make_workdir(struct ovl_fs *ofs, struct path *workpath)
 
 	ofs->workdir = ovl_workdir_create(ofs, OVL_WORKDIR_NAME, false);
 	if (!ofs->workdir)
+		goto out;
+
+	err = ovl_make_singleton_whiteout(ofs);
+	if (err < 0)
 		goto out;
 
 	/*

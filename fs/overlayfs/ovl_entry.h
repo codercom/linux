@@ -43,6 +43,11 @@ struct ovl_fs {
 	struct dentry *workdir;
 	/* index directory listing overlay inodes by origin file handle */
 	struct dentry *indexdir;
+	/*
+	 * the singleton whiteout file under workdir: all newly created
+	 * whiteout files will be linked to it if possible
+	 */
+	struct dentry *whiteout;
 	long namelen;
 	/* pathnames of lower and upper dirs, for show_options */
 	struct ovl_config config;

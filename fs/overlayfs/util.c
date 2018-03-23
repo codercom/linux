@@ -533,8 +533,10 @@ static void ovl_cleanup_index(struct dentry *dentry)
 	if (IS_ERR(index)) {
 		index = NULL;
 	} else if (ovl_index_all(dentry->d_sb)) {
+		struct ovl_fs *ofs = dentry->d_sb->s_fs_info;
+
 		/* Whiteout orphan index to block future open by handle */
-		err = ovl_cleanup_and_whiteout(indexdir, dir, index);
+		err = ovl_cleanup_and_whiteout(ofs, indexdir, dir, index);
 	} else {
 		/* Cleanup orphan index entries */
 		err = ovl_cleanup(dir, index);

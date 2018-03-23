@@ -24,6 +24,12 @@ module_param_named(redirect_max, ovl_redirect_max, ushort, 0644);
 MODULE_PARM_DESC(ovl_redirect_max,
 		 "Maximum length of absolute redirect xattr value");
 
+static unsigned int ovl_singleton_wt_link_max = 255;
+module_param_named(singleton_whiteout_link_max,
+		ovl_singleton_wt_link_max, uint, 0644);
+MODULE_PARM_DESC(ovl_singleton_wt_link_max,
+		"Maximum hardlinks of a whiteout singleton");
+
 int ovl_cleanup(struct inode *wdir, struct dentry *wdentry)
 {
 	int err;
@@ -62,18 +68,149 @@ struct dentry *ovl_lookup_temp(struct dentry *workdir)
 	return temp;
 }
 
+#define OVL_SINGLETON_WHITEOUT_NAME "whiteout"
+
+/* caller holds write lock (i_rwsem) of dir */
+static int ovl_make_singleton_whiteout_locked(struct ovl_fs *ofs,
+		struct dentry *dir, const char *name)
+{
+	int err = 0;
+	struct inode *inode = d_inode(dir);
+	struct dentry *whiteout;
+
+	whiteout = lookup_one_len(name, dir, strlen(name));
+	if (IS_ERR(whiteout))
+		return PTR_ERR(whiteout);
+
+	if (ovl_is_whiteout(whiteout)) {
+		ofs->whiteout = whiteout;
+	} else if (!whiteout->d_inode) {
+		err = ovl_do_whiteout(inode, whiteout);
+		if (!err)
+			ofs->whiteout = whiteout;
+		else
+			dput(whiteout);
+	} else {
+		/*
+		 * fallback to creating new whiteout file if
+		 * a non-whiteout file already exists
+		 */
+		dput(whiteout);
+	}
+
+	return err;
+}
+
+/*
+ * create a new whiteout file under workdir if it doesn't exist.
+ * If a non-whiteout file already exists, no error will be reported
+ * and the needed whiteout file will be newly created instead of
+ * being linked to a singleton whiteout.
+ */
+int ovl_make_singleton_whiteout(struct ovl_fs *ofs)
+{
+	int err;
+	struct inode *dir;
+
+	/* disable singleton whiteout */
+	if (ovl_singleton_wt_link_max <= 1)
+		return 0;
+
+	dir = d_inode(ofs->workdir);
+	inode_lock_nested(dir, I_MUTEX_PARENT);
+
+	err = ovl_make_singleton_whiteout_locked(ofs, ofs->workdir,
+			OVL_SINGLETON_WHITEOUT_NAME);
+
+	inode_unlock(dir);
+
+	return err;
+}
+
+/*
+ * caller holds i_mutex of workdir to ensure the operations
+ * on the singletion whiteout are serialized.
+ */
+static int ovl_link_to_singleton_whiteout(struct ovl_fs *ofs,
+		struct dentry *whiteout, bool *create_instead)
+{
+	int err;
+	struct inode *wdir = d_inode(ofs->workdir);
+	struct dentry *singleton;
+	bool retried = false;
+
+	*create_instead = false;
+retry:
+	singleton = ofs->whiteout;
+	/* Create a new singletion whiteout when the limit is exceeded */
+	if (1 < ovl_singleton_wt_link_max &&
+		singleton->d_inode->i_nlink >= ovl_singleton_wt_link_max)
+		err = -EMLINK;
+	else
+		err = ovl_do_link(singleton, wdir, whiteout, false);
+
+	if (!err) {
+		goto out;
+	} else if (err == -EMLINK && !retried) {
+		/*
+		 * The singleton already has the maximum number of links to it,
+		 * so remove the old singleton and create a new one
+		 */
+		ofs->whiteout = NULL;
+		err = ovl_do_unlink(wdir, singleton);
+		if (err) {
+			dput(singleton);
+			goto out;
+		}
+
+		dput(singleton);
+		err = ovl_make_singleton_whiteout_locked(ofs, ofs->workdir,
+				OVL_SINGLETON_WHITEOUT_NAME);
+		if (err)
+			goto out;
+
+		retried = true;
+		if (ofs->whiteout)
+			goto retry;
+		else
+			goto out_fallback;
+	} else if (err == -EXDEV) {
+		/*
+		 * upper fs may have a project id different than singleton,
+		 * so fall back to create whiteout directly
+		 */
+		goto out_fallback;
+	} else {
+		goto out;
+	}
+
+out_fallback:
+	*create_instead = true;
+out:
+	return err;
+}
+
 /* caller holds i_mutex on workdir */
-static struct dentry *ovl_whiteout(struct dentry *workdir)
+static struct dentry *ovl_whiteout(struct ovl_fs *ofs, struct dentry *workdir)
 {
 	int err;
 	struct dentry *whiteout;
 	struct inode *wdir = workdir->d_inode;
+	bool create_instead;
 
 	whiteout = ovl_lookup_temp(workdir);
 	if (IS_ERR(whiteout))
 		return whiteout;
 
-	err = ovl_do_whiteout(wdir, whiteout);
+	if (workdir == ofs->workdir && ofs->whiteout)
+		err = ovl_link_to_singleton_whiteout(ofs, whiteout,
+				&create_instead);
+	else
+		create_instead = true;
+
+	if (create_instead)
+		err = ovl_do_whiteout(wdir, whiteout);
+
 	if (err) {
 		dput(whiteout);
 		whiteout = ERR_PTR(err);
@@ -83,15 +220,15 @@ static struct dentry *ovl_whiteout(struct dentry *workdir)
 }
 
 /* Caller must hold i_mutex on both workdir and dir */
-int ovl_cleanup_and_whiteout(struct dentry *workdir, struct inode *dir,
-			     struct dentry *dentry)
+int ovl_cleanup_and_whiteout(struct ovl_fs *ofs, struct dentry *workdir,
+		struct inode *dir, struct dentry *dentry)
 {
 	struct inode *wdir = workdir->d_inode;
 	struct dentry *whiteout;
 	int err;
 	int flags = 0;
 
-	whiteout = ovl_whiteout(workdir);
+	whiteout = ovl_whiteout(ofs, workdir);
 	err = PTR_ERR(whiteout);
 	if (IS_ERR(whiteout))
 		return err;
@@ -621,6 +758,7 @@ static bool ovl_matches_upper(struct dentry *dentry, struct dentry *upper)
 static int ovl_remove_and_whiteout(struct dentry *dentry,
 				   struct list_head *list)
 {
+	struct ovl_fs *ofs = dentry->d_sb->s_fs_info;
 	struct dentry *workdir = ovl_workdir(dentry);
 	struct dentry *upperdir = ovl_dentry_upper(dentry->d_parent);
 	struct dentry *upper;
@@ -654,7 +792,7 @@ static int ovl_remove_and_whiteout(struct dentry *dentry,
 		goto out_dput_upper;
 	}
 
-	err = ovl_cleanup_and_whiteout(workdir, d_inode(upperdir), upper);
+	err = ovl_cleanup_and_whiteout(ofs, workdir, d_inode(upperdir), upper);
 	if (err)
 		goto out_d_drop;
 
